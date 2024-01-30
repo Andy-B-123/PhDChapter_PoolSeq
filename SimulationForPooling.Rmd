@@ -1,0 +1,202 @@
+---
+title: "SimulationForReal"
+author: "AB"
+date: "2023-10-12"
+output: html_document
+---
+
+```{r,message=FALSE,echo = FALSE,results='hide', warning=FALSE}
+knitr::opts_chunk$set(message=FALSE, results='hide', warning=FALSE)
+library(ggpubr)
+library(tidyverse)
+library(janitor)
+```
+
+## Simulation for assesing PoolSeq
+
+The background for this project was to assess whether we could use pooled sequencing, in combination with UMIs and Baits, to be able to identify and track Bt allele frequencies in populations of H. armigera. Bt resistance alleles in Australia are in low frequencies and so we looked to assess this method for low allele frequencies.
+
+The simulation here will aim to assess how likely it will be to identify Bt resistance alleles in ideal cases from pooled samples. Some assumptions:
+
+\- Pooling proportions are equimolar for all samples\
+- Library preparation happens equally for all molecules in the pool\
+- Bait efficiency is equivelant for all genes and for the general class of Bt resistance alleles (assessing Cry2Ab and Vip3A resistance alleles, which are \~150bp deletions)\
+- Bt resistance is homozygous in spiked-in samples and absent in background samples
+
+In this simplistic case we can look to generate a simulation for assessing what size of pools we might consider.
+
+```{r}
+num_Bt_alleles_per_individal <- 2 # For homozyguous
+num_Bt_individuals <- 2           # For Cry2Ab or Vip3A spike-in
+total_Bt_alleles <- num_Bt_individuals * num_Bt_alleles_per_individal
+```
+
+For a region, the main factor driving whether we will see the allele is coverage. With our assumptions above we can simulate 'coverage' as the number of times we look to sample our pretend population for the read containing a Bt resistance allele.
+
+So we can have a simple model where we simulate the frequency of detection of a read from one of the spiked-in samples in the background population with coverage as a poisson distribution. Positive detection would be a single read being detected from either of the two expected resistance alleles.
+
+```{r}
+coverage_tests <- c(1,5,10,20,50,100,200,500) # how many reads? per site (total not per indiv) 
+length(coverage_tests)
+pool_size <- c(5,10,20,50,100,200) # number of indiv in pool (alwys 2 x resistant)
+length(pool_size)
+expanded_df <- expand.grid(coverage_tests,pool_size)
+colnames(expanded_df) <- c( "Coverage","Pool size")
+expanded_df %>%
+  mutate(expected_Bt_frequency = total_Bt_alleles / (`Pool size` * 2)) -> expanded_df_prob
+expanded_df_prob
+```
+
+The below carries out a number of trials over a range of pool sizes and coverage values and returns the result from each trial if a Bt allele is detected or not. The number of Bt positive individuals was the same in each pool, while the background varied, leading to decreasing frequency of Bt resistance allele frequency.
+```{r}
+generate_binom_row <- function(row) {
+  n <- row['Coverage']  # Assuming 'n' is the column name for the number of trials
+  p <- row['expected_Bt_frequency']  # Assuming 'p' is the column name for the probability of success
+  rbinom(1, size = n, prob = p)  # Generate a single random binomial value for this row
+}
+num_trials <- 1000
+result_list <- list()
+for (i in 1:num_trials) {
+  result_list[[i]] <- apply(expanded_df_prob, 1, generate_binom_row)
+}
+results_single <- do.call(c,result_list)
+
+expanded_df_prob_long <- bind_rows(replicate(num_trials, expanded_df_prob, simplify = FALSE))
+expanded_df_prob_long$results_trials <- results_single
+
+expanded_df_prob_long %>%
+  group_by(Coverage, `Pool size`) %>%
+  summarise(sum_fails = sum(results_trials == 0)) %>%
+  mutate(sum_success = num_trials - sum_fails) -> expanded_df_prob_long_data
+expanded_df_prob_long_data %>%
+  pivot_longer(cols = c(sum_fails,sum_success), values_to = "Counts",names_to = "TrialOutcome") -> expanded_df_prob_long_data_long
+expanded_df_prob_long_data_long$`Pool size` <- as.factor(expanded_df_prob_long_data_long$`Pool size`)
+expanded_df_prob_long_data_long$TrialOutcome <- factor(expanded_df_prob_long_data_long$TrialOutcome, levels = c("sum_success","sum_fails"))
+```
+
+Plotting the success and failure proportions across pool and coverage values shows a clear trend of increasing coverage leading to better identification of Bt resistance alleles:
+```{r}
+Simple_assessment <- ggplot(expanded_df_prob_long_data_long, aes(x = TrialOutcome, y = Counts, fill = `Pool size`))+
+  geom_bar(stat = "identity")+
+  theme_minimal()+
+  facet_grid(Coverage ~ `Pool size`, scales = 'free') +
+  ylab("Trials")+
+  xlab("Bt allele detected")+
+  theme(legend.position="none")+
+  labs(tag = "Coverage") +
+  theme(plot.margin = margin(0.5,0.7,0.5,0.5, "cm"),
+        plot.tag.position = c(1.02, 0.5),
+        plot.tag = element_text(size = rel(1.2),angle = 270))+
+  ggtitle("Pool size")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_fill_brewer(palette = "Set2")+
+  scale_x_discrete(labels = c("+","-"))+
+  scale_y_continuous(labels = c(0,num_trials),breaks = c(0,num_trials))
+
+Simple_assessment
+ggsave("Simple_assessment.svg",Simple_assessment, width = 7, height = 7)
+```
+
+## False negative assessment
+
+False-negatives are a priority to minimise, especially for monitoring purposes. We can assess the false-negative rate of the trials and compare with the proportion of coverage in each pool. A clear inflection point is at 1x coverage / individual, with an estimated 5x+ coverage per individual providing high confidence of detection across all pool levels.
+```{r}
+expanded_df_prob_long_data %>%
+  group_by(`Pool size`,Coverage) %>%
+  summarise(mean_detection_rate = mean(sum_fails/num_trials)) %>%
+  mutate(prop_cov = Coverage / `Pool size`) -> results_df_complete_3
+results_df_complete_3$`Pool size` <- as.factor(results_df_complete_3$`Pool size`)
+
+x_axis_ticks <- c(0.01,0.1,1,10,100)
+false_negative_rate <- results_df_complete_3 %>%
+  ggplot(aes(x = prop_cov, y = mean_detection_rate, colour = `Pool size`, group = `Pool size`))+
+  geom_line()+
+  scale_x_continuous(trans='log10', breaks = x_axis_ticks, labels = paste(x_axis_ticks,"x"))+
+  ylim(0,1)+
+  xlab("Expected coverage per individual")+
+  #facet_wrap(~Pool_Size)+
+  scale_color_brewer(palette = "Set2")+
+  theme_classic()+
+  geom_vline(xintercept = 1, linetype = 'dashed', colour = 'grey', alpha = 0.8)+
+  ylab("False negative \nrate")+
+  theme(legend.position="bottom")+
+  guides(colour=guide_legend(title="Pool size",nrow = 1))+
+  theme(plot.margin = margin(0,1,0,1, "cm"))
+
+false_negative_rate
+```
+
+
+### Combine plots and output:
+
+```{r}
+#Simple_assessment
+#false_negative_rate
+combined_plot <- ggarrange(Simple_assessment,false_negative_rate,ncol = 1,heights = c(3,1),labels = "AUTO", legend = 'bottom', common.legend = T)
+#combined_plot
+ggsave("combined_plot.svg",combined_plot, width = 7, height = 9)
+```
+
+### Looking at the data from the Gautier et al paper (2013) where they provide RAD-Seq data for individual and pooled samples of Pine-Processionary moths:
+https://onlinelibrary.wiley.com/doi/full/10.1111/mec.12360 
+```{r}
+url <- "https://raw.githubusercontent.com/Andy-B-123/LittleScripts/main/mec12360-sup-0005-supplementmaterials3.csv"
+download.file(url, destfile = "SupplementMaterialS3.csv")
+data <- read.csv("SupplementMaterialS3.csv", header=TRUE)
+ppMoth_paperData <- clean_names(data)
+
+
+```
+
+### Recreate their Figure 3:
+
+```{r}
+ppMoth_paperData %>%
+  mutate(cov_ind_bins = cut(sum_of_the_individual_coverage_across_the_20_individuals / 20, breaks = c(-1,6,10,15,20,50000), 
+                            labels = c("1-6x","6-10x","10-15x","15-20x",">20x")),
+         cov_pool_bins = cut(pool_coverage_sum_over_the_ten_pool_replicates, breaks = c(-1,50,100,150,200,10000), 
+                            labels = c("1-50x","50-100x","100-150x","150-200x",">200x"))) -> ppMoth_paperData_binned
+
+ppMoth_paperData_binned %>%
+  group_by(cov_ind_bins,cov_pool_bins) %>%
+  summarise(counts_bins = n())
+
+ppMoth_paperData_binned %>%
+  ggplot(aes(x = allele_frequency_estimate_based_on_pool_seq_data_column_g_column_h, y = allele_frequency_estimate_based_on_ind_seq_data_column_d_column_e ))+
+  geom_point(alpha = 0.1)+
+  geom_smooth()+
+  theme_minimal()+
+  facet_grid(cov_ind_bins ~ cov_pool_bins)+
+  xlab("Allelic frequency estiamted from Pool")+
+  ylab("Allelic frequency estiamted from Individuals")
+```
+
+Great!
+
+Looking at false-negative rate of 'rare' alleles from pool-seq:
+
+```{r}
+
+ppMoth_paperData_binned %>%
+  filter(allele_frequency_estimate_based_on_ind_seq_data_column_d_column_e != 0,
+         allele_frequency_estimate_based_on_pool_seq_data_column_g_column_h == 0) -> PresentInIndAndNotPools
+
+overall_false_neg_rate <- length(PresentInIndAndNotPools$snp_id) / length(ppMoth_paperData_binned$snp_id)
+overall_false_neg_rate
+
+PresentInIndAndNotPools %>%
+  select(cov_ind_bins,cov_pool_bins) %>%
+  table()
+
+PresentInIndAndNotPools %>%
+  ggplot(aes(x = cov_pool_bins, y = cov_ind_bins))+
+  geom_bin2d()+
+  theme_minimal()+
+  scale_fill_viridis_c()+
+  ggtitle("Missing variants in Pool-Seq related to overall sequence coverage\n
+          (Gautier et al 2013)")+
+  xlab("Pool-Seq coverage")+
+  ylab("Ind-Seq coverage") -> PresentInIndAndNotPools_plot
+PresentInIndAndNotPools_plot
+ggsave("PresentInIndAndNotPools_plot.svg",PresentInIndAndNotPools_plot)
+```
